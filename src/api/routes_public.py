@@ -37,6 +37,9 @@ async def sdk_public(name: str, request: Request) -> JSONResponse:
 
     from .server import api
 
+    # Public read-only endpoints that don't require signature verification
+    PUBLIC_READONLY_ENDPOINTS = {"get_agent_status", "list_agents"}
+
     # Check for verified miner hotkey from platform-api (after signature verification)
     verified_hotkey = request.headers.get("X-Verified-Miner-Hotkey")
 
@@ -46,6 +49,16 @@ async def sdk_public(name: str, request: Request) -> JSONResponse:
         request.state.token_info = {
             "uid": "verified-uid",
             "miner_hotkey": verified_hotkey,
+            "job_id": request.headers.get("X-Job-Id") or "",
+            "challenge_id": os.getenv("CHALLENGE_ID", "challenge"),
+            "job_type": "",
+        }
+    elif name in PUBLIC_READONLY_ENDPOINTS:
+        # Public read-only endpoint: allow without signature verification
+        # Set minimal token_info for compatibility
+        request.state.token_info = {
+            "uid": "public-readonly-uid",
+            "miner_hotkey": request.headers.get("X-Miner-Hotkey") or "public",
             "job_id": request.headers.get("X-Job-Id") or "",
             "challenge_id": os.getenv("CHALLENGE_ID", "challenge"),
             "job_type": "",

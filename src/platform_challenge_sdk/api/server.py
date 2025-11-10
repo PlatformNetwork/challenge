@@ -66,6 +66,8 @@ async def init_app(lifecycle_registry: Any, api_registry: Any) -> FastAPI:
 
     if challenge_admin:
         # Admin mode: Register public endpoints and admin handlers
+        # Support both GET and POST for public endpoints (GET for read-only endpoints like get_agent_status)
+        app.get("/sdk/public/{name}")(sdk_public)
         app.post("/sdk/public/{name}")(sdk_public)
         app.post("/sdk/admin/db/credentials")(sdk_admin_db_credentials)
 
