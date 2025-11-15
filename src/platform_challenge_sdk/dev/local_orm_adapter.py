@@ -76,7 +76,7 @@ class LocalORMAdapter:
             QueryResult with rows and metadata
         """
         import time
-        from sqlalchemy import text, Table, MetaData, inspect
+        from sqlalchemy import text, Table, MetaData, inspect, bindparam
         from sqlalchemy.sql import select
 
         start_time = time.time()
@@ -96,17 +96,41 @@ class LocalORMAdapter:
                     # Add WHERE clause
                     where_parts = []
                     params = {}
-                    for i, filt in enumerate(query.filters):
-                        param_name = f"param_{i}"
-                        if filt.operator == "=":
+                    param_counter = 0
+                    bindparams = []
+                    for filt in query.filters:
+                        if filt.operator.upper() in ("IN", "NOT IN"):
+                            # Handle IN/NOT IN with list expansion using bindparam
+                            if not isinstance(filt.value, list):
+                                raise ValueError(f"{filt.operator} operator requires a list value")
+                            if not filt.value:
+                                # Empty list: IN () is always false, NOT IN () is always true
+                                if filt.operator.upper() == "IN":
+                                    where_parts.append("1=0")  # Always false
+                                else:
+                                    where_parts.append("1=1")  # Always true
+                            else:
+                                # Use bindparam with expanding=True for proper list handling
+                                param_name = f"param_{param_counter}"
+                                bindparams.append(bindparam(param_name, expanding=True))
+                                params[param_name] = filt.value
+                                where_parts.append(f'"{filt.column}" {filt.operator} :{param_name}')
+                                param_counter += 1
+                        elif filt.operator == "=":
+                            param_name = f"param_{param_counter}"
                             where_parts.append(f'"{filt.column}" = :{param_name}')
                             params[param_name] = filt.value
+                            param_counter += 1
                         elif filt.operator == "!=":
+                            param_name = f"param_{param_counter}"
                             where_parts.append(f'"{filt.column}" != :{param_name}')
                             params[param_name] = filt.value
+                            param_counter += 1
                         else:
+                            param_name = f"param_{param_counter}"
                             where_parts.append(f'"{filt.column}" {filt.operator} :{param_name}')
                             params[param_name] = filt.value
+                            param_counter += 1
 
                     if where_parts:
                         sql += " WHERE " + " AND ".join(where_parts)
@@ -124,7 +148,12 @@ class LocalORMAdapter:
                     if query.offset:
                         sql += f" OFFSET {query.offset}"
 
-                    result = await session.execute(text(sql), params)
+                    # Create text() with bindparams if we have any
+                    if bindparams:
+                        stmt = text(sql).bindparams(*bindparams)
+                    else:
+                        stmt = text(sql)
+                    result = await session.execute(stmt, params)
                     rows_raw = [dict(row._mapping) for row in result]
                     # Serialize rows to make them JSON-serializable
                     rows = [self._serialize_row(row) for row in rows_raw]
@@ -140,19 +169,46 @@ class LocalORMAdapter:
 
                     where_parts = []
                     params = {}
-                    for i, filt in enumerate(query.filters):
-                        param_name = f"param_{i}"
-                        if filt.operator == "=":
+                    param_counter = 0
+                    bindparams = []
+                    for filt in query.filters:
+                        if filt.operator.upper() in ("IN", "NOT IN"):
+                            # Handle IN/NOT IN with list expansion using bindparam
+                            if not isinstance(filt.value, list):
+                                raise ValueError(f"{filt.operator} operator requires a list value")
+                            if not filt.value:
+                                # Empty list: IN () is always false, NOT IN () is always true
+                                if filt.operator.upper() == "IN":
+                                    where_parts.append("1=0")  # Always false
+                                else:
+                                    where_parts.append("1=1")  # Always true
+                            else:
+                                # Use bindparam with expanding=True for proper list handling
+                                param_name = f"param_{param_counter}"
+                                bindparams.append(bindparam(param_name, expanding=True))
+                                params[param_name] = filt.value
+                                where_parts.append(f'"{filt.column}" {filt.operator} :{param_name}')
+                                param_counter += 1
+                        elif filt.operator == "=":
+                            param_name = f"param_{param_counter}"
                             where_parts.append(f'"{filt.column}" = :{param_name}')
                             params[param_name] = filt.value
+                            param_counter += 1
                         else:
+                            param_name = f"param_{param_counter}"
                             where_parts.append(f'"{filt.column}" {filt.operator} :{param_name}')
                             params[param_name] = filt.value
+                            param_counter += 1
 
                     if where_parts:
                         sql += " WHERE " + " AND ".join(where_parts)
 
-                    result = await session.execute(text(sql), params)
+                    # Create text() with bindparams if we have any
+                    if bindparams:
+                        stmt = text(sql).bindparams(*bindparams)
+                    else:
+                        stmt = text(sql)
+                    result = await session.execute(stmt, params)
                     row = result.fetchone()
                     count = row[0] if row else 0
                     execution_time = int((time.time() - start_time) * 1000)
@@ -227,21 +283,48 @@ class LocalORMAdapter:
 
                     # Add WHERE clause
                     where_parts = []
-                    for i, filt in enumerate(query.filters):
-                        param_name = f"where_{i}"
-                        if filt.operator == "=":
+                    param_counter = len(params)  # Continue from set params
+                    bindparams = []
+                    for filt in query.filters:
+                        if filt.operator.upper() in ("IN", "NOT IN"):
+                            # Handle IN/NOT IN with list expansion using bindparam
+                            if not isinstance(filt.value, list):
+                                raise ValueError(f"{filt.operator} operator requires a list value")
+                            if not filt.value:
+                                # Empty list: IN () is always false, NOT IN () is always true
+                                if filt.operator.upper() == "IN":
+                                    where_parts.append("1=0")  # Always false
+                                else:
+                                    where_parts.append("1=1")  # Always true
+                            else:
+                                # Use bindparam with expanding=True for proper list handling
+                                param_name = f"where_{param_counter}"
+                                bindparams.append(bindparam(param_name, expanding=True))
+                                params[param_name] = filt.value
+                                where_parts.append(f'"{filt.column}" {filt.operator} :{param_name}')
+                                param_counter += 1
+                        elif filt.operator == "=":
+                            param_name = f"where_{param_counter}"
                             where_parts.append(f'"{filt.column}" = :{param_name}')
                             params[param_name] = filt.value
+                            param_counter += 1
                         else:
+                            param_name = f"where_{param_counter}"
                             where_parts.append(f'"{filt.column}" {filt.operator} :{param_name}')
                             params[param_name] = filt.value
+                            param_counter += 1
 
                     if where_parts:
                         sql += " WHERE " + " AND ".join(where_parts)
 
                     sql += " RETURNING *"
 
-                    result = await session.execute(text(sql), params)
+                    # Create text() with bindparams if we have any
+                    if bindparams:
+                        stmt = text(sql).bindparams(*bindparams)
+                    else:
+                        stmt = text(sql)
+                    result = await session.execute(stmt, params)
                     rows_raw = [dict(row._mapping) for row in result]
                     # Serialize rows to make them JSON-serializable
                     rows = [self._serialize_row(row) for row in rows_raw]
@@ -257,14 +340,36 @@ class LocalORMAdapter:
 
                     where_parts = []
                     params = {}
-                    for i, filt in enumerate(query.filters):
-                        param_name = f"param_{i}"
-                        if filt.operator == "=":
+                    param_counter = 0
+                    bindparams = []
+                    for filt in query.filters:
+                        if filt.operator.upper() in ("IN", "NOT IN"):
+                            # Handle IN/NOT IN with list expansion using bindparam
+                            if not isinstance(filt.value, list):
+                                raise ValueError(f"{filt.operator} operator requires a list value")
+                            if not filt.value:
+                                # Empty list: IN () is always false, NOT IN () is always true
+                                if filt.operator.upper() == "IN":
+                                    where_parts.append("1=0")  # Always false
+                                else:
+                                    where_parts.append("1=1")  # Always true
+                            else:
+                                # Use bindparam with expanding=True for proper list handling
+                                param_name = f"param_{param_counter}"
+                                bindparams.append(bindparam(param_name, expanding=True))
+                                params[param_name] = filt.value
+                                where_parts.append(f'"{filt.column}" {filt.operator} :{param_name}')
+                                param_counter += 1
+                        elif filt.operator == "=":
+                            param_name = f"param_{param_counter}"
                             where_parts.append(f'"{filt.column}" = :{param_name}')
                             params[param_name] = filt.value
+                            param_counter += 1
                         else:
+                            param_name = f"param_{param_counter}"
                             where_parts.append(f'"{filt.column}" {filt.operator} :{param_name}')
                             params[param_name] = filt.value
+                            param_counter += 1
 
                     if where_parts:
                         sql += " WHERE " + " AND ".join(where_parts)
@@ -272,7 +377,12 @@ class LocalORMAdapter:
                         # Safety: don't allow DELETE without WHERE
                         raise ValueError("DELETE without filters is not allowed")
 
-                    result = await session.execute(text(sql), params)
+                    # Create text() with bindparams if we have any
+                    if bindparams:
+                        stmt = text(sql).bindparams(*bindparams)
+                    else:
+                        stmt = text(sql)
+                    result = await session.execute(stmt, params)
                     execution_time = int((time.time() - start_time) * 1000)
 
                     return QueryResult(
