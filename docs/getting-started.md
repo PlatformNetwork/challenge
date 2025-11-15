@@ -17,7 +17,7 @@ pip install platform-challenge-sdk
 ### Option 2: Install from Source
 
 ```bash
-git clone https://github.com/CortexLM/challenge.git
+git clone https://github.com/PlatformNetwork/challenge.git
 cd challenge
 pip install -e .
 ```

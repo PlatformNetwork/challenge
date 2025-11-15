@@ -57,7 +57,7 @@ pip install platform-challenge-sdk
 Or install from source:
 
 ```console
-git clone https://github.com/CortexLM/challenge.git
+git clone https://github.com/PlatformNetwork/challenge.git
 cd challenge
 pip install -e .
 ```
@@ -136,7 +136,7 @@ Made with love by the Cortex Foundation
 
 <!-- Repository links -->
 
-[repo_license_url]: https://github.com/CortexLM/challenge/blob/main/LICENSE
+[repo_license_url]: https://github.com/PlatformNetwork/challenge/blob/main/LICENSE
 [repo_license_img]: https://img.shields.io/badge/license-MIT-blue?style=for-the-badge&logo=none
 
 <!-- PEP 621 links -->
