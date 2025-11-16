@@ -51,29 +51,6 @@ class AeadSession:
         return json.loads(pt.decode("utf-8"))
 
 
-class PlainTextSession:
-    """Development mode session that does not encrypt messages."""
-
-    def __init__(self) -> None:
-        pass
-
-    def encrypt(self, obj: Any) -> dict[str, Any]:
-        """In dev mode, returns the JSON object directly (no encapsulation)."""
-        return obj
-
-    def decrypt(self, env: dict[str, Any] | Any) -> Any:
-        """In dev mode, returns the object directly (already in plain text)."""
-        # If it's already a dict, return it as is
-        if isinstance(env, dict):
-            # If it's a message with 'enc', it might be a real encrypted message
-            # otherwise it's plain text
-            if "enc" in env:
-                raise ValueError("Encrypted message received in plain text mode")
-            return env
-        # If it's something else (JSON string already parsed), parse it
-        if isinstance(env, str):
-            return json.loads(env)
-        return env
 
 
 async def serve_ws(websocket, path: str, quote_provider) -> None:
@@ -146,32 +123,34 @@ async def serve_ws(websocket, path: str, quote_provider) -> None:
             )
         )
 
-        # Check dev mode early
+        # Check dev mode for logging purposes
         dev_mode = os.getenv("SDK_DEV_MODE", "").lower() == "true"
-
-        if dev_mode:
-            # In dev mode, skip attestation_ok and use PlainTextSession directly
-            import logging
-
-            logging.info("🔧 DEV MODE: Skipping attestation_ok, using plain text session")
-            session = PlainTextSession()
+        tdx_simulation_mode = os.getenv("TDX_SIMULATION_MODE", "").lower() == "true"
+        
+        # Always use encryption
+        import logging
+        
+        if dev_mode or tdx_simulation_mode:
+            logging.info("🔧 DEV MODE: Using encrypted session with mock TDX attestation")
         else:
-            # Production mode: wait for attestation_ok and derive keys
-            ok_raw = await websocket.receive_text()
-            ok = json.loads(ok_raw)
-            if ok.get("type") != "attestation_ok":
-                return
+            logging.info("Production mode: Using encrypted session with real TDX attestation")
+        
+        # Wait for attestation_ok and derive keys
+        ok_raw = await websocket.receive_text()
+        ok = json.loads(ok_raw)
+        if ok.get("type") != "attestation_ok":
+            return
 
-            hkdf_salt_b64 = ok.get("hkdf_salt") or ok.get(
-                "hkdf_salt_b64", ""
-            )  # Support both field names
-            if not hkdf_salt_b64:
-                return
+        hkdf_salt_b64 = ok.get("hkdf_salt") or ok.get(
+            "hkdf_salt_b64", ""
+        )  # Support both field names
+        if not hkdf_salt_b64:
+            return
 
-            val_pub = base64.b64decode(val_x25519_pub_b64)
-            shared = crypto_scalarmult(chal_sk, val_pub)
-            aead_key = derive_aead_key(shared, hkdf_salt_b64)
-            session = AeadSession(aead_key)
+        val_pub = base64.b64decode(val_x25519_pub_b64)
+        shared = crypto_scalarmult(chal_sk, val_pub)
+        aead_key = derive_aead_key(shared, hkdf_salt_b64)
+        session = AeadSession(aead_key)
 
         # Create a queue for outgoing messages (contains JSON strings of encrypted envelopes)
         # This allows concurrent sends from background tasks
@@ -548,27 +527,16 @@ async def serve_ws(websocket, path: str, quote_provider) -> None:
         # 4) Message loop: handle messages via router
         import logging
 
-        dev_mode = os.getenv("SDK_DEV_MODE", "").lower() == "true"
-
-        if dev_mode:
-            logging.info("🔧 DEV MODE: Entering plain text message loop (no encryption)")
-        else:
-            logging.info("Entering encrypted message loop")
+        # Always using encryption
+        logging.info("Entering encrypted message loop (using ChaCha20-Poly1305)")
 
         while True:
             try:
                 msg_raw = await websocket.receive_text()
                 msg = json.loads(msg_raw)
 
-                # In dev mode, if it's already plain text, use it directly
-                # Otherwise, let the router handle it (it will detect via session)
-                if dev_mode:
-                    # In dev mode, we can receive plain text JSON directly
-                    # The router will use PlainTextSession to "decrypt" (passthrough)
-                    await router.handle_incoming_message(msg)
-                else:
-                    # Production mode: normal encrypted message
-                    await router.handle_incoming_message(msg)
+                # The router will decrypt the ChaCha20-Poly1305 encrypted message
+                await router.handle_incoming_message(msg)
 
                 # Note: All message handling is now done by registered handlers in the router
                 # The router automatically:

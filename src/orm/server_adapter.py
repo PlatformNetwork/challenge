@@ -70,11 +70,6 @@ class ServerORMAdapter:
             },
         }
 
-        # Log query for debugging
-        logger.info(
-            f"📤 Sending ORM query: operation={query.operation}, table={query.table}, query_id={query_id}"
-        )
-
         try:
             # Send via router (automatically encrypted) and wait for response
             response = await self.router.send_message(query_msg, timeout=30.0)

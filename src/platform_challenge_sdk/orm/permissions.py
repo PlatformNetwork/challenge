@@ -9,12 +9,28 @@ class TablePermission:
 
     table_name: str
     readable_columns: set[str] = field(default_factory=set)
+    writable_columns: set[str] = field(default_factory=set)  # Columns validators can write
+    allowed_operations: set[str] = field(default_factory=lambda: {"select", "count"})  # Default read-only
     allow_aggregations: bool = True
     max_rows: int | None = 10000
 
-    def add_columns(self, *columns: str) -> "TablePermission":
+    def add_readable_columns(self, *columns: str) -> "TablePermission":
         """Add readable columns to this table permission."""
         self.readable_columns.update(columns)
+        return self
+    
+    def add_columns(self, *columns: str) -> "TablePermission":
+        """Alias for add_readable_columns for backwards compatibility."""
+        return self.add_readable_columns(*columns)
+    
+    def add_writable_columns(self, *columns: str) -> "TablePermission":
+        """Add writable columns to this table permission (for validators)."""
+        self.writable_columns.update(columns)
+        return self
+    
+    def allow_operations(self, *operations: str) -> "TablePermission":
+        """Set allowed operations (select, count, insert, update, delete)."""
+        self.allowed_operations = set(operations)
         return self
 
     def to_dict(self) -> dict:
@@ -22,6 +38,8 @@ class TablePermission:
         return {
             "table_name": self.table_name,
             "readable_columns": list(self.readable_columns),
+            "writable_columns": list(self.writable_columns),
+            "allowed_operations": list(self.allowed_operations),
             "allow_aggregations": self.allow_aggregations,
             "max_rows": self.max_rows,
         }

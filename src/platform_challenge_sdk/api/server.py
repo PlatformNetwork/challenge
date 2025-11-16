@@ -25,6 +25,15 @@ async def set_ready() -> None:
             await res
 
 
+# Global app instance for route registration
+_app_instance: FastAPI | None = None
+
+
+def get_app_instance() -> FastAPI | None:
+    """Get the global FastAPI app instance."""
+    return _app_instance
+
+
 async def init_app(lifecycle_registry: Any, api_registry: Any) -> FastAPI:
     """Initialize FastAPI application with SDK endpoints and lifecycle management.
 
@@ -32,11 +41,12 @@ async def init_app(lifecycle_registry: Any, api_registry: Any) -> FastAPI:
     - CHALLENGE_ADMIN=true: Public endpoints and admin handlers are registered
     - CHALLENGE_ADMIN=false/absent: Only WebSocket and health endpoints
     """
-    global lifecycle, api
+    global lifecycle, api, _app_instance
     lifecycle = lifecycle_registry
     api = api_registry
 
     app = FastAPI()
+    _app_instance = app  # Store globally for route registration
 
     # Log dev mode status
     import os
@@ -94,29 +104,58 @@ async def init_app(lifecycle_registry: Any, api_registry: Any) -> FastAPI:
 
             from ..transport.ws import serve_ws  # type: ignore
 
-            # Check dev mode
+            # Check dev mode and mock attestation settings
             dev_mode = os.getenv("SDK_DEV_MODE", "").lower() == "true"
+            tee_enforced = os.getenv("TEE_ENFORCED", "true").lower() != "false"
+            tdx_simulation_mode = os.getenv("TDX_SIMULATION_MODE", "").lower() == "true"
+            
+            # Use mock quotes if in dev mode, TEE not enforced, or TDX simulation mode
+            # In dev mode, always use mock quotes by default (don't try real SDK)
+            # Priority: dev_mode > tdx_simulation_mode > not tee_enforced
+            use_mock_quotes = dev_mode or tdx_simulation_mode or not tee_enforced
 
             async def quote_provider(report_data: bytes):
                 import logging
                 import secrets
+                import json
 
-                # Dev mode: generate fake quote
-                if dev_mode:
-                    logging.debug("DEV MODE: Generating fake TDX quote (no verification)")
-                    # Generate a fake quote of appropriate size (TDX quotes are typically 1000+ bytes)
-                    fake_quote = secrets.token_bytes(1024)
-                    fake_event_log = '{"dev_mode": true, "compose-hash": "dev-mode-fake"}'
+                # Mock mode: generate fake quote (default for dev mode)
+                if use_mock_quotes:
+                    logging.info("🔧 MOCK MODE: Generating mock TDX quote (dev mode enabled, skipping dstack SDK)")
+                    
+                    # Generate a realistic mock quote with proper structure
+                    # Embed report_data at common TDX offsets for nonce binding
+                    fake_quote = bytearray(secrets.token_bytes(1024))
+                    report_data_32 = report_data[:32]
+                    
+                    # Embed report_data at common offsets (568, 576, 584)
+                    for offset in [568, 576, 584]:
+                        if len(fake_quote) >= offset + 32:
+                            fake_quote[offset:offset+32] = report_data_32
+                    
+                    # Generate realistic event log with compose-hash
+                    compose_hash = os.getenv("COMPOSE_HASH", "dev-mode-mock")
+                    challenge_id = os.getenv("CHALLENGE_ID", "term-challenge")
+                    fake_event_log = json.dumps({
+                        "dev_mode": True,
+                        "environment_mode": "dev",
+                        "compose-hash": compose_hash,
+                        "app-id": f"challenge-{challenge_id}",
+                        "instance-id": f"instance-{secrets.token_hex(8)}"
+                    })
+                    
+                    # Generate RTMRs (48 bytes each, hex encoded)
                     fake_rtmrs = {
                         "rtmr0": secrets.token_bytes(48).hex(),
                         "rtmr1": secrets.token_bytes(48).hex(),
                         "rtmr2": secrets.token_bytes(48).hex(),
                         "rtmr3": secrets.token_bytes(48).hex(),
                     }
-                    logging.debug(f"DEV MODE: Fake quote generated ({len(fake_quote)} bytes)")
-                    return fake_quote, fake_event_log, fake_rtmrs
+                    
+                    logging.info(f"🔧 MOCK MODE: Mock quote generated ({len(fake_quote)} bytes) with report_data embedded")
+                    return bytes(fake_quote), fake_event_log, fake_rtmrs
 
-                # Production mode: use real TDX quote
+                # Production mode: use real TDX quote (only if not in dev mode)
                 try:
                     from dstack_sdk import AsyncDstackClient  # type: ignore
 
@@ -209,8 +248,42 @@ async def init_app(lifecycle_registry: Any, api_registry: Any) -> FastAPI:
                     import logging
 
                     logging.error(f"Failed to get quote from dstack SDK: {e}", exc_info=True)
-                    # No quote available in dev mode
-                    return b"", None, None
+                    # In dev/mock mode, generate fallback mock quote instead of returning empty
+                    if use_mock_quotes:
+                        logging.warning("🔧 MOCK MODE: dstack SDK failed, generating fallback mock quote")
+                        # Generate a realistic mock quote with proper structure
+                        fake_quote = bytearray(secrets.token_bytes(1024))
+                        report_data_32 = report_data[:32]
+                        
+                        # Embed report_data at common TDX offsets for nonce binding
+                        for offset in [568, 576, 584]:
+                            if len(fake_quote) >= offset + 32:
+                                fake_quote[offset:offset+32] = report_data_32
+                        
+                        # Generate realistic event log with compose-hash
+                        compose_hash = os.getenv("COMPOSE_HASH", "dev-mode-fallback")
+                        challenge_id = os.getenv("CHALLENGE_ID", "term-challenge")
+                        fake_event_log = json.dumps({
+                            "dev_mode": True,
+                            "environment_mode": "dev",
+                            "compose-hash": compose_hash,
+                            "app-id": f"challenge-{challenge_id}",
+                            "instance-id": f"instance-{secrets.token_hex(8)}"
+                        })
+                        
+                        # Generate RTMRs (48 bytes each, hex encoded)
+                        fake_rtmrs = {
+                            "rtmr0": secrets.token_bytes(48).hex(),
+                            "rtmr1": secrets.token_bytes(48).hex(),
+                            "rtmr2": secrets.token_bytes(48).hex(),
+                            "rtmr3": secrets.token_bytes(48).hex(),
+                        }
+                        
+                        logging.info(f"🔧 MOCK MODE: Fallback mock quote generated ({len(fake_quote)} bytes) with report_data embedded")
+                        return bytes(fake_quote), fake_event_log, fake_rtmrs
+                    else:
+                        # Production mode: no quote available
+                        return b"", None, None
 
             await serve_ws(websocket, "/sdk/ws", quote_provider)
         except Exception as e:

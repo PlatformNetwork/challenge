@@ -86,11 +86,16 @@ class MessageRouter:
         """
         # Check if WebSocket is still active (health check)
         if hasattr(self, "_websocket_active") and not self._websocket_active:
-            raise Exception("WebSocket connection is not active - cannot send message")
+            raise Exception("WebSocket connection is not active - cannot send message. The WebSocket may have been disconnected. Please check the connection status.")
 
         # Check if send task is still running (health check)
         if hasattr(self, "_send_task"):
             if self._send_task.done():
+                # Check if task completed with an error
+                try:
+                    self._send_task.result()  # This will raise if task had an exception
+                except Exception as e:
+                    raise Exception(f"WebSocket send task failed: {e}") from e
                 raise Exception("WebSocket send task has stopped - connection may be broken")
 
         # Generate message ID if not already present
@@ -115,12 +120,12 @@ class MessageRouter:
             encrypted_json = json.dumps(encrypted_envelope)
 
             # Send via queue (will be handled by worker in transport/ws.py)
-            logger.debug(
-                f"📤 Putting message in queue: ID={message_id}, type={message.get('type')}"
+            logger.info(
+                f"📤 Putting message in queue: ID={message_id}, type={message.get('type')}, queue_size={self._outgoing_queue.qsize()}"
             )
             await self._outgoing_queue.put(encrypted_json)
-            logger.debug(
-                f"✅ Message put in queue successfully: ID={message_id}, type={message.get('type')}"
+            logger.info(
+                f"✅ Message put in queue successfully: ID={message_id}, type={message.get('type')}, new_queue_size={self._outgoing_queue.qsize()}"
             )
 
             logger.debug(

@@ -38,7 +38,7 @@ async def sdk_public(name: str, request: Request) -> JSONResponse:
     from .server import api
 
     # Public read-only endpoints that don't require signature verification
-    PUBLIC_READONLY_ENDPOINTS = {"get_agent_status", "list_agents"}
+    PUBLIC_READONLY_ENDPOINTS = {"get_agent_status", "list_agents", "list_agent_jobs"}
 
     # Check for verified miner hotkey from platform-api (after signature verification)
     verified_hotkey = request.headers.get("X-Verified-Miner-Hotkey")

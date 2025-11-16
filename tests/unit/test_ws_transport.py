@@ -7,7 +7,6 @@ from unittest.mock import Mock, patch, AsyncMock
 
 from platform_challenge_sdk.transport.ws import (
     AeadSession,
-    PlainTextSession,
     verify_validator_quote,
 )
 
@@ -42,37 +41,6 @@ class TestAeadSession:
         assert encrypted1["nonce"] != encrypted2["nonce"]
         # Ciphertexts should be different
         assert encrypted1["ciphertext"] != encrypted2["ciphertext"]
-
-
-class TestPlainTextSession:
-    """Tests for plain text session (dev mode)."""
-
-    def test_encrypt_decrypt(self):
-        """Test that plain text session returns objects as-is."""
-        session = PlainTextSession()
-
-        original = {"type": "test", "data": "hello"}
-        encrypted = session.encrypt(original)
-        decrypted = session.decrypt(encrypted)
-
-        assert decrypted == original
-        assert encrypted == original  # No encryption in dev mode
-
-    def test_decrypt_dict(self):
-        """Test decrypting a dictionary."""
-        session = PlainTextSession()
-        data = {"type": "test", "data": "hello"}
-        result = session.decrypt(data)
-        assert result == data
-
-    def test_decrypt_encrypted_message_raises(self):
-        """Test that encrypted messages raise error in plain text mode."""
-        session = PlainTextSession()
-        encrypted = {"enc": "chacha20poly1305", "nonce": "test", "ciphertext": "test"}
-
-        with pytest.raises(ValueError, match="Encrypted message"):
-            session.decrypt(encrypted)
-
 
 class TestVerifyValidatorQuote:
     """Tests for validator quote verification."""

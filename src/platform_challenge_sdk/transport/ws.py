@@ -51,29 +51,6 @@ class AeadSession:
         return json.loads(pt.decode("utf-8"))
 
 
-class PlainTextSession:
-    """Development mode session that does not encrypt messages."""
-
-    def __init__(self) -> None:
-        pass
-
-    def encrypt(self, obj: Any) -> dict[str, Any]:
-        """In dev mode, returns the JSON object directly (no encapsulation)."""
-        return obj
-
-    def decrypt(self, env: dict[str, Any] | Any) -> Any:
-        """In dev mode, returns the object directly (already in plain text)."""
-        # If it's already a dict, return it as is
-        if isinstance(env, dict):
-            # If it's a message with 'enc', it might be a real encrypted message
-            # otherwise it's plain text
-            if "enc" in env:
-                raise ValueError("Encrypted message received in plain text mode")
-            return env
-        # If it's something else (JSON string already parsed), parse it
-        if isinstance(env, str):
-            return json.loads(env)
-        return env
 
 
 async def verify_validator_quote(
@@ -116,10 +93,17 @@ async def verify_validator_quote(
                     break
 
         if not matched:
-            return {
-                "valid": False,
-                "error": "Validator quote report_data does not match nonce (nonce binding failed)",
-            }
+            # In dev mode, be more lenient with mock quotes - they may not have proper nonce binding
+            if dev_mode:
+                logging.warning(
+                    "DEV MODE: Nonce binding check failed for mock quote (accepting anyway)"
+                )
+                # Continue with validation but log the warning
+            else:
+                return {
+                    "valid": False,
+                    "error": "Validator quote report_data does not match nonce (nonce binding failed)",
+                }
 
         # Verify environment mode isolation (dev/prod)
         if val_event_log:
@@ -174,13 +158,20 @@ async def verify_validator_quote(
 async def serve_ws(websocket, path: str, quote_provider) -> None:
     from starlette.websockets import WebSocketDisconnect
 
+    import logging
+    logger = logging.getLogger(__name__)
+    
     try:
+        logger.info(f"WebSocket connection received on path: {path}")
         # 1) Await attestation_begin
         # FastAPI/Starlette WebSocket API uses receive_text() instead of recv()
         begin_raw = await websocket.receive_text()
+        logger.info(f"Received first message: {begin_raw[:100]}...")
         begin = json.loads(begin_raw)
         if begin.get("type") != "attestation_begin":
+            logger.warning(f"Expected attestation_begin, got: {begin.get('type')}")
             return
+        logger.info("Received attestation_begin, starting attestation process")
 
         nonce_hex = begin["nonce"]
         val_x25519_pub_b64 = begin["val_x25519_pub"]
@@ -203,7 +194,12 @@ async def serve_ws(websocket, path: str, quote_provider) -> None:
         import os
 
         dev_mode = os.getenv("SDK_DEV_MODE", "").lower() == "true"
+        tee_enforced = os.getenv("TEE_ENFORCED", "true").lower() != "false"
+        tdx_simulation_mode = os.getenv("TDX_SIMULATION_MODE", "").lower() == "true"
         env_mode = os.getenv("ENVIRONMENT_MODE", "dev" if dev_mode else "prod")
+        
+        # In dev mode with TEE_ENFORCED=false or TDX_SIMULATION_MODE=true, accept mock quotes
+        use_mock_attestation = not tee_enforced or tdx_simulation_mode or dev_mode
 
         if val_quote_b64:
             # Validate validator quote structure and environment
@@ -218,21 +214,28 @@ async def serve_ws(websocket, path: str, quote_provider) -> None:
 
             if not validation_result["valid"]:
                 error_msg = validation_result.get("error", "Validator quote verification failed")
-                logging.error(f"Validator quote verification failed: {error_msg}")
-                await websocket.send_text(
-                    json.dumps(
-                        {
-                            "type": "attestation_reject",
-                            "reason": error_msg,
-                        }
+                # In mock mode, accept quotes even if verification fails (they're mock quotes)
+                if use_mock_attestation:
+                    logging.warning(
+                        f"DEV/MOCK MODE: Validator quote verification failed but accepting mock quote: {error_msg}"
                     )
-                )
-                return
+                    logging.info("Accepting connection with mock attestation")
+                else:
+                    logging.error(f"Validator quote verification failed: {error_msg}")
+                    await websocket.send_text(
+                        json.dumps(
+                            {
+                                "type": "attestation_reject",
+                                "reason": error_msg,
+                            }
+                        )
+                    )
+                    return
             else:
                 logging.info("Validator quote verified (mutual attestation)")
         else:
             # In production, validator quote is required
-            if not dev_mode:
+            if not use_mock_attestation:
                 logging.error(
                     "Security error: Validator quote required for mutual attestation in production"
                 )
@@ -247,7 +250,7 @@ async def serve_ws(websocket, path: str, quote_provider) -> None:
                 return
             else:
                 logging.warning(
-                    "DEV MODE: Validator quote not provided (mutual attestation skipped)"
+                    "DEV/MOCK MODE: Validator quote not provided (mutual attestation skipped)"
                 )
 
         # 2) Generate challenge X25519 keypair and quote
@@ -256,17 +259,27 @@ async def serve_ws(websocket, path: str, quote_provider) -> None:
 
         quote, event_log, rtmrs = await quote_provider(report_data)
 
-        # Validate quote before sending - must not be empty (unless dev mode)
+        # Validate quote before sending - must not be empty (unless mock mode)
         quote_len = len(quote) if quote else 0
         if not quote or quote_len < 100:
             import logging
 
-            if dev_mode:
-                # In dev mode, generate a fake quote if provider returned empty
-                logging.warning("DEV MODE: Quote provider returned empty, generating fake quote")
-                quote = secrets.token_bytes(1024)
+            if use_mock_attestation:
+                # In mock mode, generate a fake quote if provider returned empty
+                logging.warning("🔧 MOCK MODE: Quote provider returned empty, generating fallback mock quote")
+                quote_bytes = bytearray(secrets.token_bytes(1024))
+                # Embed report_data for nonce binding
+                report_data_32 = report_data[:32]
+                for offset in [568, 576, 584]:
+                    if len(quote_bytes) >= offset + 32:
+                        quote_bytes[offset:offset+32] = report_data_32
+                quote = bytes(quote_bytes)
                 if not event_log:
-                    event_log = '{"dev_mode": true}'
+                    event_log = json.dumps({
+                        "dev_mode": True,
+                        "environment_mode": "dev",
+                        "compose-hash": os.getenv("COMPOSE_HASH", "dev-mode-fallback")
+                    })
                 if not rtmrs:
                     rtmrs = {}
             else:
@@ -310,32 +323,34 @@ async def serve_ws(websocket, path: str, quote_provider) -> None:
             )
         )
 
-        # Check dev mode early
+        # Check dev mode for logging purposes
         dev_mode = os.getenv("SDK_DEV_MODE", "").lower() == "true"
-
-        if dev_mode:
-            # In dev mode, skip attestation_ok and use PlainTextSession directly
-            import logging
-
-            logging.info("DEV MODE: Skipping attestation_ok, using plain text session")
-            session = PlainTextSession()
+        tdx_simulation_mode = os.getenv("TDX_SIMULATION_MODE", "").lower() == "true"
+        
+        # Always use encryption
+        import logging
+        
+        if dev_mode or tdx_simulation_mode:
+            logging.info("DEV MODE: Using encrypted session with mock TDX attestation")
         else:
-            # Production mode: wait for attestation_ok and derive keys
-            ok_raw = await websocket.receive_text()
-            ok = json.loads(ok_raw)
-            if ok.get("type") != "attestation_ok":
-                return
+            logging.info("Production mode: Using encrypted session with real TDX attestation")
+        
+        # Wait for attestation_ok and derive keys
+        ok_raw = await websocket.receive_text()
+        ok = json.loads(ok_raw)
+        if ok.get("type") != "attestation_ok":
+            return
 
-            hkdf_salt_b64 = ok.get("hkdf_salt") or ok.get(
-                "hkdf_salt_b64", ""
-            )  # Support both field names
-            if not hkdf_salt_b64:
-                return
+        hkdf_salt_b64 = ok.get("hkdf_salt") or ok.get(
+            "hkdf_salt_b64", ""
+        )  # Support both field names
+        if not hkdf_salt_b64:
+            return
 
-            val_pub = base64.b64decode(val_x25519_pub_b64)
-            shared = crypto_scalarmult(chal_sk, val_pub)
-            aead_key = derive_aead_key(shared, hkdf_salt_b64)
-            session = AeadSession(aead_key)
+        val_pub = base64.b64decode(val_x25519_pub_b64)
+        shared = crypto_scalarmult(chal_sk, val_pub)
+        aead_key = derive_aead_key(shared, hkdf_salt_b64)
+        session = AeadSession(aead_key)
 
         # Create a queue for outgoing messages (contains JSON strings of encrypted envelopes)
         # This allows concurrent sends from background tasks
@@ -378,7 +393,7 @@ async def serve_ws(websocket, path: str, quote_provider) -> None:
 
                     await websocket.send_text(msg)
                     outgoing_queue.task_done()
-                    logging.debug(f"Queue worker: Message #{message_count} sent successfully")
+                    # (Logging removed for verbosity)
                 except Exception as e:
                     logging.error(
                         f"Queue worker error sending message #{message_count}: {e}",
@@ -425,10 +440,41 @@ async def serve_ws(websocket, path: str, quote_provider) -> None:
             logging.info(f"DB version: {db_version}")
 
             migrations = []
-            migrations_dir = "db/migrations/v1"
-
-            # hashlib and os are already imported at the top of the file
-            if os.path.exists(migrations_dir):
+            # Try multiple possible paths for migrations directory
+            # In Docker, the challenge code is typically mounted at /app/term-challenge
+            # The working directory is usually /app
+            possible_paths = [
+                "db/migrations/v1",  # Relative to current working directory
+                "term-challenge/db/migrations/v1",  # If working dir is /app
+                os.path.join(os.getcwd(), "db", "migrations", f"v{db_version}"),
+                os.path.join(os.getcwd(), "term-challenge", "db", "migrations", f"v{db_version}"),
+            ]
+            
+            # Also try to find db/migrations by walking up from current directory
+            current_dir = os.getcwd()
+            for _ in range(5):  # Walk up max 5 levels
+                test_path = os.path.join(current_dir, "db", "migrations", f"v{db_version}")
+                if os.path.exists(test_path):
+                    possible_paths.insert(0, test_path)
+                    break
+                # Also try term-challenge subdirectory
+                test_path_term = os.path.join(current_dir, "term-challenge", "db", "migrations", f"v{db_version}")
+                if os.path.exists(test_path_term):
+                    possible_paths.insert(0, test_path_term)
+                    break
+                parent = os.path.dirname(current_dir)
+                if parent == current_dir:  # Reached root
+                    break
+                current_dir = parent
+            
+            migrations_dir = None
+            for path in possible_paths:
+                if os.path.exists(path) and os.path.isdir(path):
+                    migrations_dir = path
+                    logging.info(f"Found migrations directory: {migrations_dir}")
+                    break
+            
+            if migrations_dir and os.path.exists(migrations_dir):
                 for filename in sorted(os.listdir(migrations_dir)):
                     if filename.endswith(".sql"):
                         filepath = os.path.join(migrations_dir, filename)
@@ -455,9 +501,20 @@ async def serve_ws(websocket, path: str, quote_provider) -> None:
                             logging.error(f"Failed to read migration {filename}: {e}")
                             continue
             else:
-                logging.warning(f"Migrations directory {migrations_dir} does not exist")
+                if migrations_dir:
+                    logging.warning(f"Migrations directory {migrations_dir} does not exist")
+                else:
+                    logging.warning("Could not find migrations directory in any of the expected locations")
 
             # Send migrations_response with db_version
+            logging.info(
+                f"Preparing migrations_response: {len(migrations)} migrations found, db_version={db_version}"
+            )
+            if migrations:
+                logging.info(f"Migration versions: {[m.get('version') for m in migrations]}")
+            else:
+                logging.warning("No migrations found - sending empty migrations list")
+            
             await router.send_push_message(
                 {
                     "type": "migrations_response",
@@ -466,7 +523,7 @@ async def serve_ws(websocket, path: str, quote_provider) -> None:
                 }
             )
             logging.info(
-                f"Sending migrations_response: {len(migrations)} migrations, db_version={db_version}"
+                f"✅ Sent migrations_response: {len(migrations)} migrations, db_version={db_version}"
             )
 
         async def handle_db_version_request(msg: dict) -> None:
@@ -485,7 +542,7 @@ async def serve_ws(websocket, path: str, quote_provider) -> None:
 
         async def handle_orm_ready(msg: dict) -> None:
             """Handle orm_ready signal from platform-api."""
-            logging.info("Received orm_ready signal from platform-api")
+            logging.info("✅ Received orm_ready signal from platform-api - initializing ServerORMAdapter")
 
             # Platform-api sends schema name in orm_ready, but SDK does not store it
             # Platform-api will set the schema for each ORM query - SDK just sends queries without schema
@@ -581,8 +638,9 @@ async def serve_ws(websocket, path: str, quote_provider) -> None:
                     else:
                         # Run synchronously if not async
                         handler()
+                    logging.info("✅ on_orm_ready handler scheduled - services should now be initialized")
                 else:
-                    logging.debug("No on_orm_ready handler registered (this is optional)")
+                    logging.warning("⚠️  No on_orm_ready handler registered - services will not be initialized!")
             except Exception as e:
                 logging.error(f"Failed to call on_orm_ready handler: {e}", exc_info=True)
 
@@ -592,7 +650,7 @@ async def serve_ws(websocket, path: str, quote_provider) -> None:
             query_id = msg.get("query_id") or msg.get("message_id")
 
             if query_id:
-                logging.info(f"📥 Received orm_result with query_id={query_id}")
+                # (Logging removed for verbosity)
                 # This is a response to a server-side ORM query
                 # Forward to the ServerORMAdapter if it exists
                 from ..challenge.decorators import challenge
@@ -686,12 +744,85 @@ async def serve_ws(websocket, path: str, quote_provider) -> None:
             # Execute in background (asynchronous)
             asyncio.create_task(execute_handler())
 
+        async def handle_validator_status_update(msg: dict) -> None:
+            """Handle validator_status_update message from platform-api.
+            
+            Updates the ValidatorPool with validator information from platform-api.
+            This ensures the challenge knows which validators are available for job distribution.
+            """
+            import os
+            import sys
+            
+            try:
+                compose_hash = msg.get("compose_hash", "")
+                validators = msg.get("validators", [])
+                
+                logging.info(
+                    f"📥 Received validator_status_update: {len(validators)} validators for compose_hash={compose_hash}"
+                )
+                
+                if not validators:
+                    logging.warning("Received empty validator list from platform-api")
+                    return
+                
+                # Try to get ValidatorPool from term-challenge if available
+                # This is a soft dependency - if ValidatorPool is not available, we just log
+                validator_pool = None
+                try:
+                    # Try importing from services.validator_pool (term-challenge specific)
+                    from services.validator_pool import get_validator_pool
+                    validator_pool = get_validator_pool()
+                    logging.debug("Successfully imported get_validator_pool from services.validator_pool")
+                except ImportError as e:
+                    # ValidatorPool is specific to term-challenge, not available in base SDK
+                    logging.debug(f"ValidatorPool not available (expected for base SDK): {e}")
+                    return
+                except Exception as e:
+                    logging.warning(f"Failed to import ValidatorPool: {e}", exc_info=True)
+                    return
+                
+                if not validator_pool:
+                    logging.warning(
+                        "ValidatorPool not initialized yet (will be available after on_orm_ready). "
+                        "Will retry when pool is ready."
+                    )
+                    # Store validators temporarily? Or just wait for next update?
+                    # For now, we'll just log and wait for the next periodic update
+                    return
+                
+                # Update validator pool
+                registered_count = 0
+                for validator_data in validators:
+                    if isinstance(validator_data, dict):
+                        hotkey = validator_data.get("hotkey")
+                        status = validator_data.get("status", "active")
+                        
+                        if hotkey:
+                            is_active = status == "active"
+                            validator_pool.register_validator(
+                                hotkey=hotkey,
+                                compose_hash=compose_hash,
+                                is_active=is_active
+                            )
+                            registered_count += 1
+                            logging.debug(f"Registered validator: {hotkey} (active={is_active})")
+                
+                active_count = len(validator_pool.get_active_validators(compose_hash))
+                logging.info(
+                    f"✅ Updated validator pool: {registered_count} validators registered, "
+                    f"{active_count} active for compose_hash={compose_hash}"
+                )
+                    
+            except Exception as e:
+                logging.error(f"Error handling validator_status_update: {e}", exc_info=True)
+
         # Register all handlers
         router.register_handler("migrations_request", handle_migrations_request)
         router.register_handler("db_version_request", handle_db_version_request)
         router.register_handler("orm_ready", handle_orm_ready)
         router.register_handler("orm_result", handle_orm_result)
         router.register_handler("job_execute", handle_job_execute)
+        router.register_handler("validator_status_update", handle_validator_status_update)
 
         # Assign router to challenge registry for global access
         try:
@@ -710,27 +841,16 @@ async def serve_ws(websocket, path: str, quote_provider) -> None:
         # 4) Message loop: handle messages via router
         import logging
 
-        dev_mode = os.getenv("SDK_DEV_MODE", "").lower() == "true"
-
-        if dev_mode:
-            logging.info("DEV MODE: Entering plain text message loop (no encryption)")
-        else:
-            logging.info("Entering encrypted message loop")
+        # Always using encryption
+        logging.info("Entering encrypted message loop (using ChaCha20-Poly1305)")
 
         while True:
             try:
                 msg_raw = await websocket.receive_text()
                 msg = json.loads(msg_raw)
 
-                # In dev mode, if it's already plain text, use it directly
-                # Otherwise, let the router handle it (it will detect via session)
-                if dev_mode:
-                    # In dev mode, we can receive plain text JSON directly
-                    # The router will use PlainTextSession to "decrypt" (passthrough)
-                    await router.handle_incoming_message(msg)
-                else:
-                    # Production mode: normal encrypted message
-                    await router.handle_incoming_message(msg)
+                # The router will decrypt the ChaCha20-Poly1305 encrypted message
+                await router.handle_incoming_message(msg)
 
                 # Note: All message handling is now done by registered handlers in the router
                 # The router automatically:
@@ -743,15 +863,22 @@ async def serve_ws(websocket, path: str, quote_provider) -> None:
                 logging.warning(
                     "WARNING: WebSocket disconnected by client - ORM queries will fail until reconnected"
                 )
-                # Mark router as inactive
+                # Mark router as inactive and cancel all pending requests
                 try:
                     from ..challenge.decorators import challenge
 
                     if hasattr(challenge, "message_router") and challenge.message_router:
-                        challenge.message_router._websocket_active = False  # type: ignore
-                except Exception:
+                        router = challenge.message_router
+                        router._websocket_active = False  # type: ignore
+                        # Cancel all pending requests to avoid timeouts
+                        for message_id, future in router._pending_requests.items():
+                            if not future.done():
+                                future.cancel()
+                                logging.debug(f"Cancelled pending request: {message_id}")
+                        router._pending_requests.clear()
+                except Exception as e:
                     # Failed to update router state, non-critical during disconnect
-                    pass
+                    logging.debug(f"Failed to update router state during disconnect: {e}")
                 # Signal queue worker to stop
                 await outgoing_queue.put(None)
                 break
